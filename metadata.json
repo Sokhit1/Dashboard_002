@@ -1,0 +1,8 @@
+{
+  "name": "Nexora CRM",
+  "description": "Advanced Sales & Customer Management Dashboard with interactive deals pipeline, revenue forecasting, lead analytics, and team performance tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
