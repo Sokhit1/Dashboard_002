@@ -1,5 +1,12 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { dataProvider } from '../services/dataService';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  dataProvider,
+  deleteSupabaseRecord,
+  fetchDatasetFromSupabase,
+  pushDatasetToSupabase,
+  syncSupabaseEntity,
+} from '../services/dataService';
+import { isSupabaseConfigured } from '../lib/supabase';
 import { useAuth } from './AuthContext';
 import {
   Account,
@@ -78,6 +85,14 @@ interface CrmContextValue {
   metrics: DerivedMetrics;
   toasts: ToastMessage[];
   quickCreateMode: QuickCreateMode | null;
+  supabaseSync: {
+    configured: boolean;
+    syncing: boolean;
+    lastSyncedAt: string | null;
+    error: string | null;
+  };
+  syncFromSupabase: () => Promise<void>;
+  pushDemoToSupabase: () => Promise<void>;
   openQuickCreate: (mode: QuickCreateMode) => void;
   closeQuickCreate: () => void;
   addToast: (title: string, description?: string, variant?: ToastMessage['variant']) => void;
@@ -148,6 +163,13 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [dataset, setDataset] = useState<CrmDataset>(() => dataProvider.loadDataset());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [quickCreateMode, setQuickCreateMode] = useState<QuickCreateMode | null>(null);
+  const [supabaseSync, setSupabaseSync] = useState({
+    configured: isSupabaseConfigured(),
+    syncing: false,
+    lastSyncedAt: null as string | null,
+    error: null as string | null,
+  });
+  const initialRemoteSyncedRef = useRef(false);
 
   // Persist dataset changes to localStorage
   useEffect(() => {
@@ -274,29 +296,102 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }));
   }, []);
 
+  const syncFromSupabase = useCallback(async () => {
+    if (!isSupabaseConfigured()) return;
+    setSupabaseSync((prev) => ({ ...prev, syncing: true, error: null }));
+    const result = await fetchDatasetFromSupabase(dataset.preferences);
+    if (result.error) {
+      setSupabaseSync((prev) => ({ ...prev, syncing: false, error: result.error || null }));
+      addToast('Supabase sync notice', result.error, 'warning');
+      return;
+    }
+    if (result.dataset) {
+      setDataset(result.dataset);
+      setSupabaseSync((prev) => ({
+        ...prev,
+        syncing: false,
+        lastSyncedAt: new Date().toISOString(),
+        error: null,
+      }));
+      addToast('Synced with Supabase', 'Loaded latest CRM workspace records from PostgreSQL.');
+    } else {
+      setSupabaseSync((prev) => ({ ...prev, syncing: false, error: null }));
+      addToast(
+        'Supabase database is empty',
+        'Click "Push Sample Data" in Settings to initialize your CRM tables.',
+        'info'
+      );
+    }
+  }, [dataset.preferences, addToast]);
+
+  const pushDemoToSupabase = useCallback(async () => {
+    if (!isSupabaseConfigured()) {
+      addToast(
+        'Supabase not configured',
+        'Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in environment secrets first.',
+        'warning'
+      );
+      return;
+    }
+    setSupabaseSync((prev) => ({ ...prev, syncing: true, error: null }));
+    const res = await pushDatasetToSupabase(dataset);
+    if (!res.ok) {
+      setSupabaseSync((prev) => ({ ...prev, syncing: false, error: res.error || 'Sync failed' }));
+      addToast('Supabase push failed', res.error, 'error');
+      return;
+    }
+    setSupabaseSync((prev) => ({
+      ...prev,
+      syncing: false,
+      lastSyncedAt: new Date().toISOString(),
+      error: null,
+    }));
+    addToast('Seeded Supabase PostgreSQL', 'All 15 CRM tables synced successfully.');
+  }, [dataset, addToast]);
+
+  // Auto-hydrate from Supabase once authenticated when configured
+  useEffect(() => {
+    if (!isSupabaseConfigured() || !session || initialRemoteSyncedRef.current) return;
+    initialRemoteSyncedRef.current = true;
+    void fetchDatasetFromSupabase(dataset.preferences).then((res) => {
+      if (res.dataset) {
+        setDataset(res.dataset);
+        setSupabaseSync((prev) => ({
+          ...prev,
+          lastSyncedAt: new Date().toISOString(),
+          error: null,
+        }));
+      }
+    });
+  }, [session, dataset.preferences]);
+
   const updateCurrentUser = useCallback(
     (patch: Partial<User>) => {
+      const updated = { ...currentUser, ...patch };
       setDataset((prev) => ({
         ...prev,
-        users: prev.users.map((u) => (u.id === currentUser.id ? { ...u, ...patch } : u)),
+        users: prev.users.map((u) => (u.id === currentUser.id ? updated : u)),
       }));
+      void syncSupabaseEntity({ type: 'user', data: updated });
       addToast('Profile updated', 'Your user settings have been saved.');
     },
-    [currentUser.id, addToast]
+    [currentUser, addToast]
   );
 
   const updateOrganization = useCallback(
     (patch: Partial<Organization>) => {
+      const nextOrg = { ...dataset.organization, ...patch };
       setDataset((prev) => ({
         ...prev,
-        organization: { ...prev.organization, ...patch },
+        organization: nextOrg,
         preferences: patch.currency
           ? { ...prev.preferences, currency: patch.currency }
           : prev.preferences,
       }));
+      void syncSupabaseEntity({ type: 'organization', data: nextOrg });
       addToast('Organization updated', 'Workspace preferences saved.');
     },
-    [addToast]
+    [dataset.organization, addToast]
   );
 
   // Leads CRUD
@@ -312,6 +407,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         leads: [created, ...prev.leads],
       }));
+      void syncSupabaseEntity({ type: 'lead', data: created });
       addToast('Lead created', `${created.firstName} ${created.lastName} (${created.company})`);
       return created;
     },
@@ -322,7 +418,12 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string, patch: Partial<Lead>) => {
       setDataset((prev) => ({
         ...prev,
-        leads: prev.leads.map((l) => (l.id === id ? { ...l, ...patch } : l)),
+        leads: prev.leads.map((l) => {
+          if (l.id !== id) return l;
+          const next = { ...l, ...patch };
+          void syncSupabaseEntity({ type: 'lead', data: next });
+          return next;
+        }),
       }));
       addToast('Lead updated');
     },
@@ -335,6 +436,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         leads: prev.leads.filter((l) => l.id !== id),
       }));
+      void deleteSupabaseRecord('leads', id);
       addToast('Lead deleted', undefined, 'info');
     },
     [addToast]
@@ -389,6 +491,9 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         leads: prev.leads.map((l) => (l.id === leadId ? { ...l, status: 'Qualified' } : l)),
         deals: [newDeal, ...prev.deals],
       }));
+      if (createdAccount) void syncSupabaseEntity({ type: 'account', data: createdAccount });
+      void syncSupabaseEntity({ type: 'lead', data: { ...lead, status: 'Qualified' } });
+      void syncSupabaseEntity({ type: 'deal', data: newDeal });
       addToast('Lead converted to Deal', `${newDeal.title} added to Qualification stage.`);
       return newDeal;
     },
@@ -411,6 +516,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         deals: [created, ...prev.deals],
       }));
+      void syncSupabaseEntity({ type: 'deal', data: created });
       addToast('Deal created', created.title);
       return created;
     },
@@ -425,13 +531,15 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         deals: prev.deals.map((d) => {
           if (d.id !== id) return d;
           const nextStage = patch.stage ?? d.stage;
-          return {
+          const updated: Deal = {
             ...d,
             ...patch,
             status: nextStage === 'closed_won' ? 'Won' : patch.status ?? d.status,
             closedAt: nextStage === 'closed_won' ? d.closedAt || patch.closedAt || now : undefined,
             updatedAt: now,
           };
+          void syncSupabaseEntity({ type: 'deal', data: updated });
+          return updated;
         }),
       }));
       addToast('Deal updated');
@@ -445,6 +553,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         deals: prev.deals.filter((d) => d.id !== id),
       }));
+      void deleteSupabaseRecord('deals', id);
       addToast('Deal deleted', undefined, 'info');
     },
     [addToast]
@@ -457,42 +566,38 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       const stageLabel = dataset.dealStages.find((s) => s.id === stage)?.name || stage;
       const now = new Date().toISOString();
 
-      setDataset((prev) => {
-        const nextDeals = prev.deals.map((d) =>
-          d.id === dealId
-            ? {
-                ...d,
-                stage,
-                status: stage === 'closed_won' ? ('Won' as const) : d.status === 'Won' ? ('On Track' as const) : d.status,
-                closedAt: stage === 'closed_won' ? d.closedAt || '2025-05-18T12:00:00Z' : undefined,
-                updatedAt: now,
-              }
-            : d
-        );
+      const updatedDeal: Deal = {
+        ...target,
+        stage,
+        status: stage === 'closed_won' ? ('Won' as const) : target.status === 'Won' ? ('On Track' as const) : target.status,
+        closedAt: stage === 'closed_won' ? target.closedAt || '2025-05-18T12:00:00Z' : undefined,
+        updatedAt: now,
+      };
 
-        const logActivity: Activity = {
-          id: generateId('act'),
-          organizationId: prev.organization.id,
-          type: stage === 'closed_won' ? 'Note Added' : 'Document Viewed',
-          title: `Moved to ${stageLabel}`,
-          description: `${target.title} moved to ${stageLabel}.`,
-          accountId: target.accountId,
-          dealId: target.id,
-          ownerId: currentUser.id,
-          occurredAt: now,
-          relativeTimeLabel: 'Just now',
-        };
+      const logActivity: Activity = {
+        id: generateId('act'),
+        organizationId: dataset.organization.id,
+        type: stage === 'closed_won' ? 'Note Added' : 'Document Viewed',
+        title: `Moved to ${stageLabel}`,
+        description: `${target.title} moved to ${stageLabel}.`,
+        accountId: target.accountId,
+        dealId: target.id,
+        ownerId: currentUser.id,
+        occurredAt: now,
+        relativeTimeLabel: 'Just now',
+      };
 
-        return {
-          ...prev,
-          deals: nextDeals,
-          activities: [logActivity, ...prev.activities],
-        };
-      });
+      setDataset((prev) => ({
+        ...prev,
+        deals: prev.deals.map((d) => (d.id === dealId ? updatedDeal : d)),
+        activities: [logActivity, ...prev.activities],
+      }));
 
+      void syncSupabaseEntity({ type: 'deal', data: updatedDeal });
+      void syncSupabaseEntity({ type: 'activity', data: logActivity });
       addToast(`Moved to ${stageLabel}`, target.title);
     },
-    [dataset.deals, dataset.dealStages, currentUser.id, addToast]
+    [dataset.deals, dataset.dealStages, dataset.organization.id, currentUser.id, addToast]
   );
 
   // Contacts CRUD
@@ -505,6 +610,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createdAt: new Date().toISOString(),
       };
       setDataset((prev) => ({ ...prev, contacts: [created, ...prev.contacts] }));
+      void syncSupabaseEntity({ type: 'contact', data: created });
       addToast('Contact added', `${created.firstName} ${created.lastName}`);
       return created;
     },
@@ -515,7 +621,12 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string, patch: Partial<Contact>) => {
       setDataset((prev) => ({
         ...prev,
-        contacts: prev.contacts.map((c) => (c.id === id ? { ...c, ...patch } : c)),
+        contacts: prev.contacts.map((c) => {
+          if (c.id !== id) return c;
+          const next = { ...c, ...patch };
+          void syncSupabaseEntity({ type: 'contact', data: next });
+          return next;
+        }),
       }));
       addToast('Contact updated');
     },
@@ -528,6 +639,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         contacts: prev.contacts.filter((c) => c.id !== id),
       }));
+      void deleteSupabaseRecord('contacts', id);
       addToast('Contact deleted', undefined, 'info');
     },
     [addToast]
@@ -543,6 +655,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createdAt: new Date().toISOString(),
       };
       setDataset((prev) => ({ ...prev, accounts: [created, ...prev.accounts] }));
+      void syncSupabaseEntity({ type: 'account', data: created });
       addToast('Account added', created.name);
       return created;
     },
@@ -553,7 +666,12 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string, patch: Partial<Account>) => {
       setDataset((prev) => ({
         ...prev,
-        accounts: prev.accounts.map((a) => (a.id === id ? { ...a, ...patch } : a)),
+        accounts: prev.accounts.map((a) => {
+          if (a.id !== id) return a;
+          const next = { ...a, ...patch };
+          void syncSupabaseEntity({ type: 'account', data: next });
+          return next;
+        }),
       }));
       addToast('Account updated');
     },
@@ -566,6 +684,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         accounts: prev.accounts.filter((a) => a.id !== id),
       }));
+      void deleteSupabaseRecord('accounts', id);
       addToast('Account deleted', undefined, 'info');
     },
     [addToast]
@@ -582,6 +701,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         relativeTimeLabel: 'Just now',
       };
       setDataset((prev) => ({ ...prev, activities: [created, ...prev.activities] }));
+      void syncSupabaseEntity({ type: 'activity', data: created });
       addToast('Activity logged', created.title);
       return created;
     },
@@ -594,6 +714,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         activities: prev.activities.filter((a) => a.id !== id),
       }));
+      void deleteSupabaseRecord('activities', id);
       addToast('Activity removed', undefined, 'info');
     },
     [addToast]
@@ -609,6 +730,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createdAt: new Date().toISOString(),
       };
       setDataset((prev) => ({ ...prev, followUps: [created, ...prev.followUps] }));
+      void syncSupabaseEntity({ type: 'follow_up', data: created });
       addToast('Follow-up scheduled', created.description);
       return created;
     },
@@ -619,7 +741,12 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string, patch: Partial<FollowUp>) => {
       setDataset((prev) => ({
         ...prev,
-        followUps: prev.followUps.map((f) => (f.id === id ? { ...f, ...patch } : f)),
+        followUps: prev.followUps.map((f) => {
+          if (f.id !== id) return f;
+          const next = { ...f, ...patch };
+          void syncSupabaseEntity({ type: 'follow_up', data: next });
+          return next;
+        }),
       }));
       if (patch.status === 'Completed') {
         addToast('Follow-up marked complete');
@@ -636,6 +763,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         followUps: prev.followUps.filter((f) => f.id !== id),
       }));
+      void deleteSupabaseRecord('follow_ups', id);
       addToast('Follow-up deleted', undefined, 'info');
     },
     [addToast]
@@ -651,6 +779,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createdAt: new Date().toISOString(),
       };
       setDataset((prev) => ({ ...prev, meetings: [created, ...prev.meetings] }));
+      void syncSupabaseEntity({ type: 'meeting', data: created });
       addToast('Meeting scheduled', created.title);
       return created;
     },
@@ -661,7 +790,12 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string, patch: Partial<Meeting>) => {
       setDataset((prev) => ({
         ...prev,
-        meetings: prev.meetings.map((m) => (m.id === id ? { ...m, ...patch } : m)),
+        meetings: prev.meetings.map((m) => {
+          if (m.id !== id) return m;
+          const next = { ...m, ...patch };
+          void syncSupabaseEntity({ type: 'meeting', data: next });
+          return next;
+        }),
       }));
       addToast('Meeting updated');
     },
@@ -674,6 +808,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         meetings: prev.meetings.filter((m) => m.id !== id),
       }));
+      void deleteSupabaseRecord('meetings', id);
       addToast('Meeting cancelled', undefined, 'info');
     },
     [addToast]
@@ -689,6 +824,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         createdAt: new Date().toISOString(),
       };
       setDataset((prev) => ({ ...prev, products: [created, ...prev.products] }));
+      void syncSupabaseEntity({ type: 'product', data: created });
       addToast('Product added', created.name);
       return created;
     },
@@ -699,7 +835,12 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     (id: string, patch: Partial<Product>) => {
       setDataset((prev) => ({
         ...prev,
-        products: prev.products.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+        products: prev.products.map((p) => {
+          if (p.id !== id) return p;
+          const next = { ...p, ...patch };
+          void syncSupabaseEntity({ type: 'product', data: next });
+          return next;
+        }),
       }));
       addToast('Product updated');
     },
@@ -712,6 +853,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         products: prev.products.filter((p) => p.id !== id),
       }));
+      void deleteSupabaseRecord('products', id);
       addToast('Product deleted', undefined, 'info');
     },
     [addToast]
@@ -727,6 +869,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         updatedAt: new Date().toISOString(),
       };
       setDataset((prev) => ({ ...prev, documents: [created, ...prev.documents] }));
+      void syncSupabaseEntity({ type: 'document', data: created });
       addToast('Document uploaded', created.name);
       return created;
     },
@@ -739,6 +882,7 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         ...prev,
         documents: prev.documents.filter((d) => d.id !== id),
       }));
+      void deleteSupabaseRecord('documents', id);
       addToast('Document removed', undefined, 'info');
     },
     [addToast]
@@ -747,14 +891,23 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const markNotificationRead = useCallback((id: string) => {
     setDataset((prev) => ({
       ...prev,
-      notifications: prev.notifications.map((n) => (n.id === id ? { ...n, read: true } : n)),
+      notifications: prev.notifications.map((n) => {
+        if (n.id !== id) return n;
+        const next = { ...n, read: true };
+        void syncSupabaseEntity({ type: 'notification', data: next });
+        return next;
+      }),
     }));
   }, []);
 
   const markAllNotificationsRead = useCallback(() => {
     setDataset((prev) => ({
       ...prev,
-      notifications: prev.notifications.map((n) => ({ ...n, read: true })),
+      notifications: prev.notifications.map((n) => {
+        const next = { ...n, read: true };
+        void syncSupabaseEntity({ type: 'notification', data: next });
+        return next;
+      }),
     }));
   }, []);
 
@@ -884,6 +1037,9 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     metrics,
     toasts,
     quickCreateMode,
+    supabaseSync,
+    syncFromSupabase,
+    pushDemoToSupabase,
     openQuickCreate,
     closeQuickCreate,
     addToast,

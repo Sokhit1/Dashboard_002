@@ -54,8 +54,16 @@ function AnimatedRoutes() {
 }
 
 function AppShell() {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, authLoading } = useAuth();
   const location = useLocation();
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F4F6FA] dark:bg-slate-950">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[#0AA6AD] border-t-transparent" />
+      </div>
+    );
+  }
 
   if (!isAuthenticated || location.pathname === '/login' || location.pathname === '/signup') {
     const authTab = location.pathname === '/signup' ? 'signup' : 'signin';

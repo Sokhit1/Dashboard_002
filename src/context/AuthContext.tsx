@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import type { Session as SupabaseSession } from '@supabase/supabase-js';
 import { SEED_USERS } from '../data/seedData';
-import { getSupabaseConfig } from '../services/dataService';
+import { getSupabaseClient, isSupabaseConfigured } from '../lib/supabase';
 
 const AUTH_USERS_KEY = 'nexora_auth_users_v1';
 const AUTH_SESSION_KEY = 'nexora_auth_session_v1';
@@ -24,28 +25,32 @@ export interface AuthSession {
   signedInAt: string;
 }
 
-interface AuthResult {
+export interface AuthResult {
   ok: boolean;
   error?: string;
+  message?: string;
 }
 
 interface AuthContextValue {
   session: AuthSession | null;
   isAuthenticated: boolean;
+  authLoading: boolean;
   registeredAccounts: AuthAccountRecord[];
   authProviderMode: 'local' | 'supabase';
-  signIn: (email: string, password: string) => AuthResult;
-  signUp: (input: { name: string; email: string; password: string; role: string }) => AuthResult;
-  signInWithProvider: (provider: 'google' | 'apple', profile?: { name: string; email: string }) => void;
+  signIn: (email: string, password: string) => Promise<AuthResult>;
+  signUp: (input: { name: string; email: string; password: string; role: string }) => Promise<AuthResult>;
+  signInWithProvider: (
+    provider: 'google' | 'apple',
+    profile?: { name: string; email: string }
+  ) => Promise<AuthResult>;
   signInDemo: (email?: string) => void;
-  resetPassword: (email: string, newPassword: string) => AuthResult;
-  signOut: () => void;
+  resetPassword: (email: string, newPassword?: string) => Promise<AuthResult>;
+  signOut: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 function hashPassword(raw: string): string {
-  // Deterministic lightweight client-side digest for local demo auth
   let hash = 5381;
   for (let i = 0; i < raw.length; i += 1) {
     hash = (hash * 33) ^ raw.charCodeAt(i);
@@ -80,11 +85,10 @@ function loadAccounts(): AuthAccountRecord[] {
   }
 }
 
-function loadSession(): AuthSession | null {
+function loadLocalSession(): AuthSession | null {
   try {
     const raw = localStorage.getItem(AUTH_SESSION_KEY);
     if (!raw) {
-      // Auto-start with Alex Morgan demo session on first visit so dashboard is immediately usable
       const defaultUser = SEED_USERS[0];
       const initialSession: AuthSession = {
         userId: defaultUser.id,
@@ -104,10 +108,62 @@ function loadSession(): AuthSession | null {
   }
 }
 
+function mapSupabaseSession(sbSession: SupabaseSession | null): AuthSession | null {
+  if (!sbSession?.user) return null;
+  const u = sbSession.user;
+  const meta = (u.user_metadata || {}) as Record<string, unknown>;
+  const providerRaw = String(u.app_metadata?.provider || 'email').toLowerCase();
+  const provider: AuthSession['provider'] =
+    providerRaw === 'google' ? 'google' : providerRaw === 'apple' ? 'apple' : 'email';
+
+  const fallbackName = u.email ? u.email.split('@')[0].replace(/[._]/g, ' ') : 'Workspace User';
+  const name = String(meta.full_name || meta.name || fallbackName);
+
+  return {
+    userId: u.id,
+    name,
+    email: u.email || '',
+    role: String(meta.role || 'Account Executive'),
+    provider,
+    signedInAt: u.last_sign_in_at || new Date().toISOString(),
+  };
+}
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const supabaseReady = isSupabaseConfigured();
   const [registeredAccounts, setRegisteredAccounts] = useState<AuthAccountRecord[]>(() => loadAccounts());
-  const [session, setSession] = useState<AuthSession | null>(() => loadSession());
-  const supabase = getSupabaseConfig();
+  const [session, setSession] = useState<AuthSession | null>(() =>
+    supabaseReady ? null : loadLocalSession()
+  );
+  const [authLoading, setAuthLoading] = useState<boolean>(supabaseReady);
+
+  // Sync Supabase Auth session when configured
+  useEffect(() => {
+    const client = getSupabaseClient();
+    if (!client) {
+      setAuthLoading(false);
+      return;
+    }
+
+    let mounted = true;
+    client.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      const mapped = mapSupabaseSession(data.session);
+      setSession(mapped ?? loadLocalSession());
+      setAuthLoading(false);
+    });
+
+    const { data: listener } = client.auth.onAuthStateChange((_event, sbSession) => {
+      if (!mounted) return;
+      setSession(mapSupabaseSession(sbSession));
+      setAuthLoading(false);
+    });
+
+    return () => {
+      mounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -118,18 +174,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [registeredAccounts]);
 
   useEffect(() => {
+    if (supabaseReady) return;
     try {
       localStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(session));
     } catch {
       // ignore storage errors
     }
-  }, [session]);
+  }, [session, supabaseReady]);
 
   const signIn = useCallback(
-    (email: string, password: string): AuthResult => {
+    async (email: string, password: string): Promise<AuthResult> => {
       const normalized = email.trim().toLowerCase();
       if (!normalized || !password) {
         return { ok: false, error: 'Please enter both your email and password.' };
+      }
+
+      const client = getSupabaseClient();
+      if (client) {
+        const { data, error } = await client.auth.signInWithPassword({
+          email: normalized,
+          password,
+        });
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        setSession(mapSupabaseSession(data.session));
+        return { ok: true };
       }
 
       const found = registeredAccounts.find((a) => a.email.toLowerCase() === normalized);
@@ -155,7 +225,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const signUp = useCallback(
-    (input: { name: string; email: string; password: string; role: string }): AuthResult => {
+    async (input: { name: string; email: string; password: string; role: string }): Promise<AuthResult> => {
       const cleanName = input.name.trim();
       const cleanEmail = input.email.trim().toLowerCase();
       const cleanRole = input.role.trim() || 'Account Executive';
@@ -168,6 +238,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       if (input.password.length < 6) {
         return { ok: false, error: 'Password must be at least 6 characters long.' };
+      }
+
+      const client = getSupabaseClient();
+      if (client) {
+        const { data, error } = await client.auth.signUp({
+          email: cleanEmail,
+          password: input.password,
+          options: {
+            data: {
+              full_name: cleanName,
+              role: cleanRole,
+            },
+          },
+        });
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        if (data.session) {
+          setSession(mapSupabaseSession(data.session));
+          return { ok: true };
+        }
+        return {
+          ok: true,
+          message: 'Account created! Check your inbox to confirm your email address before signing in.',
+        };
       }
 
       const exists = registeredAccounts.some((a) => a.email.toLowerCase() === cleanEmail);
@@ -200,7 +295,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const signInWithProvider = useCallback(
-    (provider: 'google' | 'apple', profile?: { name: string; email: string }) => {
+    async (
+      provider: 'google' | 'apple',
+      profile?: { name: string; email: string }
+    ): Promise<AuthResult> => {
+      const client = getSupabaseClient();
+      if (client) {
+        const { error } = await client.auth.signInWithOAuth({
+          provider,
+          options: {
+            redirectTo: window.location.origin,
+          },
+        });
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        return { ok: true };
+      }
+
       const targetEmail = (profile?.email || 'alex.morgan@nexoracrm.io').trim().toLowerCase();
       const targetName = (profile?.name || 'Alex Morgan').trim();
 
@@ -226,6 +338,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         provider,
         signedInAt: new Date().toISOString(),
       });
+      return { ok: true };
     },
     [registeredAccounts]
   );
@@ -249,9 +362,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   );
 
   const resetPassword = useCallback(
-    (email: string, newPassword: string): AuthResult => {
+    async (email: string, newPassword = ''): Promise<AuthResult> => {
       const normalized = email.trim().toLowerCase();
       if (!normalized) return { ok: false, error: 'Enter your account email.' };
+
+      const client = getSupabaseClient();
+      if (client) {
+        const { error } = await client.auth.resetPasswordForEmail(normalized, {
+          redirectTo: `${window.location.origin}/login`,
+        });
+        if (error) {
+          return { ok: false, error: error.message };
+        }
+        return {
+          ok: true,
+          message: 'Password reset link sent to your email via Supabase Auth.',
+        };
+      }
+
       if (newPassword.length < 6) {
         return { ok: false, error: 'New password must be at least 6 characters.' };
       }
@@ -264,13 +392,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           a.email.toLowerCase() === normalized ? { ...a, passwordHash: hashPassword(newPassword) } : a
         )
       );
-      return { ok: true };
+      return {
+        ok: true,
+        message: 'Password updated! You can now sign in with your new password.',
+      };
     },
     [registeredAccounts]
   );
 
-  const signOut = useCallback(() => {
+  const signOut = useCallback(async () => {
+    const client = getSupabaseClient();
+    if (client) {
+      await client.auth.signOut();
+    }
     setSession(null);
+    try {
+      localStorage.setItem(AUTH_SESSION_KEY, 'null');
+    } catch {
+      // ignore storage errors
+    }
   }, []);
 
   return (
@@ -278,8 +418,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       value={{
         session,
         isAuthenticated: Boolean(session),
+        authLoading,
         registeredAccounts,
-        authProviderMode: supabase.configured ? 'supabase' : 'local',
+        authProviderMode: supabaseReady ? 'supabase' : 'local',
         signIn,
         signUp,
         signInWithProvider,

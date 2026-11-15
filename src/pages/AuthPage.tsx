@@ -32,13 +32,14 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signin' }) =>
   const [password, setPassword] = useState(initialMode === 'signup' ? '' : 'Nexora2025!');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
-  // Quick provider modal state for Google / Apple sign-in
+  // Quick provider modal state for Local Demo Google / Apple sign-in
   const [providerPrompt, setProviderPrompt] = useState<'google' | 'apple' | null>(null);
-  const [providerName, setProviderName] = useState('Sokhit');
-  const [providerEmail, setProviderEmail] = useState('sokhit1@gmail.com');
+  const [providerName, setProviderName] = useState('Alex Morgan');
+  const [providerEmail, setProviderEmail] = useState('alex.morgan@nexoracrm.io');
 
   const passwordScore =
     (password.length >= 6 ? 1 : 0) +
@@ -55,52 +56,84 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signin' }) =>
       setPassword('');
       setConfirmPassword('');
     } else if (next === 'signin') {
-      setEmail('alex.morgan@nexoracrm.io');
-      setPassword('Nexora2025!');
+      if (authProviderMode === 'local') {
+        setEmail('alex.morgan@nexoracrm.io');
+        setPassword('Nexora2025!');
+      } else {
+        setPassword('');
+      }
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccessMsg('');
+    setSubmitting(true);
 
-    if (mode === 'signin') {
-      const res = signIn(email, password);
-      if (!res.ok) {
-        setError(res.error || 'Unable to sign in.');
-        return;
+    try {
+      if (mode === 'signin') {
+        const res = await signIn(email, password);
+        if (!res.ok) {
+          setError(res.error || 'Unable to sign in.');
+          return;
+        }
+        navigate('/', { replace: true });
+      } else if (mode === 'signup') {
+        if (password !== confirmPassword) {
+          setError('Passwords do not match.');
+          return;
+        }
+        const res = await signUp({ name, email, password, role });
+        if (!res.ok) {
+          setError(res.error || 'Unable to create account.');
+          return;
+        }
+        if (res.message) {
+          setSuccessMsg(res.message);
+          setMode('signin');
+          return;
+        }
+        navigate('/', { replace: true });
+      } else {
+        const res = await resetPassword(email, password);
+        if (!res.ok) {
+          setError(res.error || 'Unable to reset password.');
+          return;
+        }
+        setSuccessMsg(
+          res.message || 'Password updated! You can now sign in with your new password.'
+        );
+        setMode('signin');
       }
-      navigate('/', { replace: true });
-    } else if (mode === 'signup') {
-      if (password !== confirmPassword) {
-        setError('Passwords do not match.');
-        return;
-      }
-      const res = signUp({ name, email, password, role });
-      if (!res.ok) {
-        setError(res.error || 'Unable to create account.');
-        return;
-      }
-      navigate('/', { replace: true });
-    } else {
-      const res = resetPassword(email, password);
-      if (!res.ok) {
-        setError(res.error || 'Unable to reset password.');
-        return;
-      }
-      setSuccessMsg('Password updated! You can now sign in with your new password.');
-      setMode('signin');
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  const handleProviderContinue = (e: React.FormEvent) => {
+  const handleProviderClick = async (provider: 'google' | 'apple') => {
+    setError('');
+    if (authProviderMode === 'supabase') {
+      setSubmitting(true);
+      const res = await signInWithProvider(provider);
+      setSubmitting(false);
+      if (!res.ok) {
+        setError(res.error || `Unable to sign in with ${provider}.`);
+      }
+      return;
+    }
+    setProviderPrompt(provider);
+  };
+
+  const handleProviderContinue = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!providerPrompt) return;
-    signInWithProvider(providerPrompt, {
+    setSubmitting(true);
+    await signInWithProvider(providerPrompt, {
       name: providerName.trim() || 'Alex Morgan',
       email: providerEmail.trim() || 'alex.morgan@nexoracrm.io',
     });
+    setSubmitting(false);
     setProviderPrompt(null);
     navigate('/', { replace: true });
   };
@@ -267,60 +300,62 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signin' }) =>
             </div>
           </div>
 
-          <div>
-            <div className="mb-1 flex items-center justify-between">
-              <label className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                {mode === 'forgot' ? 'New Password' : 'Password'}
-              </label>
-              {mode === 'signin' && (
+          {!(mode === 'forgot' && authProviderMode === 'supabase') && (
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <label className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                  {mode === 'forgot' ? 'New Password' : 'Password'}
+                </label>
+                {mode === 'signin' && (
+                  <button
+                    type="button"
+                    onClick={() => switchMode('forgot')}
+                    className="text-[11px] font-semibold text-[#0AA6AD] hover:underline"
+                  >
+                    Forgot password?
+                  </button>
+                )}
+              </div>
+              <div className="relative">
+                <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <input
+                  required
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className={inputCls}
+                />
                 <button
                   type="button"
-                  onClick={() => switchMode('forgot')}
-                  className="text-[11px] font-semibold text-[#0AA6AD] hover:underline"
+                  onClick={() => setShowPassword((s) => !s)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
                 >
-                  Forgot password?
+                  {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
+              </div>
+              {mode === 'signup' && password.length > 0 && (
+                <div className="mt-1.5 flex items-center gap-1.5">
+                  {[1, 2, 3, 4].map((lvl) => (
+                    <span
+                      key={lvl}
+                      className={`h-1 flex-1 rounded-full transition-colors ${
+                        passwordScore >= lvl
+                          ? passwordScore >= 3
+                            ? 'bg-[#0AA6AD]'
+                            : 'bg-amber-400'
+                          : 'bg-slate-200 dark:bg-slate-700'
+                      }`}
+                    />
+                  ))}
+                  <span className="text-[10px] text-slate-400 ml-1">
+                    {passwordScore >= 3 ? 'Strong' : 'Fair'}
+                  </span>
+                </div>
               )}
             </div>
-            <div className="relative">
-              <Lock className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
-              <input
-                required
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                className={inputCls}
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((s) => !s)}
-                aria-label={showPassword ? 'Hide password' : 'Show password'}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
-              >
-                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-              </button>
-            </div>
-            {mode === 'signup' && password.length > 0 && (
-              <div className="mt-1.5 flex items-center gap-1.5">
-                {[1, 2, 3, 4].map((lvl) => (
-                  <span
-                    key={lvl}
-                    className={`h-1 flex-1 rounded-full transition-colors ${
-                      passwordScore >= lvl
-                        ? passwordScore >= 3
-                          ? 'bg-[#0AA6AD]'
-                          : 'bg-amber-400'
-                        : 'bg-slate-200 dark:bg-slate-700'
-                    }`}
-                  />
-                ))}
-                <span className="text-[10px] text-slate-400 ml-1">
-                  {passwordScore >= 3 ? 'Strong' : 'Fair'}
-                </span>
-              </div>
-            )}
-          </div>
+          )}
 
           {mode === 'signup' && (
             <div>
@@ -343,14 +378,19 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signin' }) =>
 
           <motion.button
             whileTap={{ scale: 0.98 }}
+            disabled={submitting}
             type="submit"
-            className="mt-2 flex w-full items-center justify-center gap-2 rounded-full bg-[#0AA6AD] py-2.5 text-xs font-semibold text-white shadow-[0_6px_18px_rgba(10,166,173,0.35)] hover:bg-[#088c92] transition-colors"
+            className="mt-2 flex w-full items-center justify-center gap-2 rounded-full bg-[#0AA6AD] py-2.5 text-xs font-semibold text-white shadow-[0_6px_18px_rgba(10,166,173,0.35)] hover:bg-[#088c92] disabled:opacity-60 transition-colors"
           >
             <span>
-              {mode === 'signin'
+              {submitting
+                ? 'Authenticating...'
+                : mode === 'signin'
                 ? 'Sign In'
                 : mode === 'signup'
                 ? 'Create Account'
+                : authProviderMode === 'supabase'
+                ? 'Send Reset Link'
                 : 'Update Password'}
             </span>
             <ArrowRight className="h-3.5 w-3.5" />
@@ -379,9 +419,10 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signin' }) =>
             <div className="grid grid-cols-2 gap-2.5">
               <motion.button
                 whileTap={{ scale: 0.97 }}
+                disabled={submitting}
                 type="button"
-                onClick={() => setProviderPrompt('google')}
-                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                onClick={() => void handleProviderClick('google')}
+                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
               >
                 {/* Authentic Google G SVG */}
                 <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden="true">
@@ -407,9 +448,10 @@ export const AuthPage: React.FC<AuthPageProps> = ({ initialMode = 'signin' }) =>
 
               <motion.button
                 whileTap={{ scale: 0.97 }}
+                disabled={submitting}
                 type="button"
-                onClick={() => setProviderPrompt('apple')}
-                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                onClick={() => void handleProviderClick('apple')}
+                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
               >
                 {/* Authentic Apple SVG */}
                 <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current" aria-hidden="true">
