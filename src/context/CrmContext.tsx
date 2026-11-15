@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { dataProvider } from '../services/dataService';
+import { useAuth } from './AuthContext';
 import {
   Account,
   Activity,
@@ -143,6 +144,7 @@ interface CrmContextValue {
 const CrmContext = createContext<CrmContextValue | null>(null);
 
 export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const { session } = useAuth();
   const [dataset, setDataset] = useState<CrmDataset>(() => dataProvider.loadDataset());
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [quickCreateMode, setQuickCreateMode] = useState<QuickCreateMode | null>(null);
@@ -151,6 +153,58 @@ export const CrmProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   useEffect(() => {
     dataProvider.saveDataset(dataset);
   }, [dataset]);
+
+  // Keep active user synchronized with AuthContext session
+  useEffect(() => {
+    if (!session) return;
+    setDataset((prev) => {
+      const targetEmail = session.email.toLowerCase();
+      const existing = prev.users.find(
+        (u) => u.id === session.userId || u.email.toLowerCase() === targetEmail
+      );
+
+      if (existing) {
+        if (existing.isCurrentUser && existing.name === session.name && existing.role === session.role) {
+          return prev;
+        }
+        return {
+          ...prev,
+          users: prev.users.map((u) =>
+            u.id === existing.id
+              ? { ...u, name: session.name, role: session.role, isCurrentUser: true }
+              : { ...u, isCurrentUser: false }
+          ),
+        };
+      }
+
+      const parts = session.name.trim().split(/\s+/);
+      const initials =
+        parts.length >= 2
+          ? `${parts[0][0]}${parts[1][0]}`.toUpperCase()
+          : session.name.slice(0, 2).toUpperCase();
+
+      const newUser: User = {
+        id: session.userId,
+        organizationId: prev.organization.id,
+        name: session.name,
+        email: session.email,
+        role: session.role,
+        initials,
+        avatarColor: '#0AA6AD',
+        monthlyQuota: 100000,
+        annualQuota: 220000,
+        conversionRate: 18.5,
+        phone: '+1 (415) 555-0198',
+        isCurrentUser: true,
+        createdAt: session.signedInAt,
+      };
+
+      return {
+        ...prev,
+        users: [newUser, ...prev.users.map((u) => ({ ...u, isCurrentUser: false }))],
+      };
+    });
+  }, [session]);
 
   // Sync dark mode class on <html>
   useEffect(() => {

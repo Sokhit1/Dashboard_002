@@ -4,8 +4,10 @@
  */
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { AnimatePresence, MotionConfig, motion } from 'motion/react';
+import { AuthProvider, useAuth } from './context/AuthContext';
 import { CrmProvider } from './context/CrmContext';
 import { AppLayout } from './components/layout/AppLayout';
+import { AuthPage } from './pages/AuthPage';
 import { DashboardPage } from './pages/DashboardPage';
 import { LeadsPage } from './pages/LeadsPage';
 import { DealsPage } from './pages/DealsPage';
@@ -51,16 +53,32 @@ function AnimatedRoutes() {
   );
 }
 
+function AppShell() {
+  const { isAuthenticated } = useAuth();
+  const location = useLocation();
+
+  if (!isAuthenticated || location.pathname === '/login' || location.pathname === '/signup') {
+    const authTab = location.pathname === '/signup' ? 'signup' : 'signin';
+    return <AuthPage key={authTab} initialMode={authTab} />;
+  }
+
+  return (
+    <AppLayout>
+      <AnimatedRoutes />
+    </AppLayout>
+  );
+}
+
 export default function App() {
   return (
     <MotionConfig reducedMotion="user">
-      <CrmProvider>
-        <BrowserRouter>
-          <AppLayout>
-            <AnimatedRoutes />
-          </AppLayout>
-        </BrowserRouter>
-      </CrmProvider>
+      <AuthProvider>
+        <CrmProvider>
+          <BrowserRouter>
+            <AppShell />
+          </BrowserRouter>
+        </CrmProvider>
+      </AuthProvider>
     </MotionConfig>
   );
 }

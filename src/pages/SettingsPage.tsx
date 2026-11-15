@@ -1,12 +1,17 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion } from 'motion/react';
-import { Save, RotateCcw, Database, Sun, Moon } from 'lucide-react';
+import { Save, RotateCcw, Database, Sun, Moon, ShieldCheck, LogOut, ArrowRightLeft } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
 import { useCrm } from '../context/CrmContext';
 import { getSupabaseConfig } from '../services/dataService';
 import { CurrencyCode } from '../types/crm';
 import { ConfirmDialog } from '../components/common/ConfirmDialog';
+import { UserAvatar } from '../components/common/Avatar';
 
 export const SettingsPage: React.FC = () => {
+  const navigate = useNavigate();
+  const { session, authProviderMode, signOut } = useAuth();
   const {
     dataset,
     currentUser,
@@ -14,6 +19,7 @@ export const SettingsPage: React.FC = () => {
     updateOrganization,
     updatePreferences,
     resetDemoData,
+    addToast,
   } = useCrm();
 
   const [name, setName] = useState(currentUser.name);
@@ -24,6 +30,13 @@ export const SettingsPage: React.FC = () => {
   const [currency, setCurrency] = useState<CurrencyCode>(dataset.preferences.currency);
   const [annualTarget, setAnnualTarget] = useState(String(dataset.organization.annualTarget));
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+
+  useEffect(() => {
+    setName(currentUser.name);
+    setEmail(currentUser.email);
+    setRole(currentUser.role);
+    setPhone(currentUser.phone);
+  }, [currentUser.id, currentUser.name, currentUser.email, currentUser.role, currentUser.phone]);
 
   const supabaseStatus = getSupabaseConfig();
 
@@ -57,8 +70,64 @@ export const SettingsPage: React.FC = () => {
       <div>
         <h1 className="text-xl font-bold text-slate-900 dark:text-white">Settings</h1>
         <p className="text-xs text-slate-500 dark:text-slate-400">
-          Manage your profile, workspace currency, appearance, notification preferences, and data layer
+          Manage your account session, profile, workspace currency, appearance, notifications, and data layer
         </p>
+      </div>
+
+      {/* Account & Authentication Session */}
+      <div className="ios-card bg-white p-5 dark:bg-slate-900">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5">
+            <UserAvatar
+              name={currentUser.name}
+              initials={currentUser.initials}
+              color={currentUser.avatarColor}
+              size="lg"
+            />
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
+                  {session?.name || currentUser.name}
+                </h2>
+                <span className="inline-flex items-center gap-1 rounded-full bg-teal-50 px-2 py-0.5 text-[10px] font-semibold text-[#0AA6AD] dark:bg-teal-950/60">
+                  <ShieldCheck className="h-3 w-3" />
+                  {authProviderMode === 'supabase' ? 'Supabase Auth' : 'Active Session'}
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                {session?.email || currentUser.email} · {session?.role || currentUser.role}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <motion.button
+              whileTap={{ scale: 0.96 }}
+              type="button"
+              onClick={() => {
+                signOut();
+                navigate('/signup');
+              }}
+              className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 px-3.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800 whitespace-nowrap"
+            >
+              <ArrowRightLeft className="h-3.5 w-3.5 text-[#0AA6AD]" />
+              <span>Switch Account / Sign Up</span>
+            </motion.button>
+            <motion.button
+              whileTap={{ scale: 0.96 }}
+              type="button"
+              onClick={() => {
+                signOut();
+                addToast('Signed out', 'You have signed out of Nexora CRM.', 'info');
+                navigate('/login');
+              }}
+              className="inline-flex items-center gap-1.5 rounded-full border border-[#FF6155]/40 px-3.5 py-1.5 text-xs font-medium text-[#FF6155] hover:bg-[#FF6155]/10 whitespace-nowrap"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>Sign Out</span>
+            </motion.button>
+          </div>
+        </div>
       </div>
 
       {/* User Profile */}
